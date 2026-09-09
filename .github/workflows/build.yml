@@ -32,3 +32,39 @@ jobs:
             ${{ matrix.configuration }}/SilentPatchBully.asi
             ${{ matrix.configuration }}/SilentPatchBully.ini
           if-no-files-found: error
+
+  release:
+    needs: build
+    if: github.event_name == 'push' && github.ref == 'refs/heads/master'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/download-artifact@v4
+        with:
+          name: SilentPatchBully-Master
+          path: dist
+
+      - name: Read version from versionmeta.props
+        id: version
+        run: |
+          rev=$(sed -n 's/.*<SILENTPATCH_REVISION_ID>\([0-9]*\)<.*/\1/p' SilentPatchBully/versionmeta.props)
+          build=$(sed -n 's/.*<SILENTPATCH_BUILD_ID>\([0-9]*\)<.*/\1/p' SilentPatchBully/versionmeta.props)
+          echo "tag=build-${rev}.${build}-${GITHUB_SHA::7}" >> "$GITHUB_OUTPUT"
+          echo "title=Build ${rev}.${build} (${GITHUB_SHA::7})" >> "$GITHUB_OUTPUT"
+
+      - name: Package
+        run: cd dist && zip SilentPatchBully.zip SilentPatchBully.asi SilentPatchBully.ini
+
+      - name: Create GitHub Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release create "${{ steps.version.outputs.tag }}" dist/SilentPatchBully.zip \
+            --repo "$GITHUB_REPOSITORY" \
+            --target "$GITHUB_SHA" \
+            --title "${{ steps.version.outputs.title }}" \
+            --generate-notes
