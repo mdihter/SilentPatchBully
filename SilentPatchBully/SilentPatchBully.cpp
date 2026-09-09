@@ -7,7 +7,6 @@
 #define _WIN32_WINNT 0x0600
 
 #include <windows.h>
-#include <Xinput.h>
 #include <Shlwapi.h>
 #include <Shlobj.h>
 #include <mmsystem.h>
@@ -47,12 +46,11 @@
 
 
 static HINSTANCE hDLLModule;
-static HANDLE hShutdownEvent = NULL;
 
 // Path to SilentPatchBully.ini next to the ASI, filled in by InjectHooks before anything reads it
 static wchar_t g_iniPath[MAX_PATH];
 
-// Immediate operand of the instruction patched by the FPSLimit INI option - the FPS cap value, INT_MAX = uncapped
+// Immediate operand of the frame limiter's FPS cap value
 static int32_t* const FPS_CAP_OPERAND = reinterpret_cast<int32_t*>(0x40618F + 1);
 
 // ============= Optional diagnostics log (LogFile=1 in the INI) =============
@@ -687,180 +685,140 @@ namespace GameSettings
 	}
 }
 
-// ============= In-game FPS cap toggle (SELECT + DPAD DOWN on a controller, F11 on the keyboard by default) =============
-namespace FPSToggle
+// ============= Automatic FPS cap while scripts known to misbehave at high frame rates are running =============
+namespace ScriptFPSLimit
 {
-	static constexpr size_t MAX_CYCLE_VALUES = 8;
-	static int32_t cycleValues[MAX_CYCLE_VALUES] = { 30, 60 };
-	static size_t numCycleValues = 2;
-	static int toggleKey = VK_F11;       // Virtual-key code, 0 disables the keyboard toggle
-	static bool controllerToggle = true; // false disables the controller combo
+	// CScriptManager singleton - keeps the running top level scripts (missions, classes, area scripts) in a small array
+	static uint8_t* const SCRIPT_MANAGER = reinterpret_cast<uint8_t*>(0xD02850);
+	static constexpr size_t SCRIPTS_OFFSET = 0x6B64;     // CScript* scripts[MAX_SCRIPTS]
+	static constexpr size_t NUM_SCRIPTS_OFFSET = 0x6B84; // Number of used entries
+	static constexpr size_t MAX_SCRIPTS = 8;
+	static constexpr size_t SCRIPT_NAME_OFFSET = 4;      // char name[SCRIPT_NAME_SIZE] in CScript, exactly as passed to LaunchScript ("2_08", "AreaScripts/Bdorm.lua")
+	static constexpr size_t SCRIPT_NAME_SIZE = 64;
 
-	using XInputGetStateFn = DWORD (WINAPI*)(DWORD dwUserIndex, XINPUT_STATE* pState);
-	static XInputGetStateFn pXInputGetState = nullptr;
+	static constexpr size_t MAX_LIST_ENTRIES = 32;
+	static constexpr size_t MAX_NAME_LENGTH = 31;
+	static char scriptNames[MAX_LIST_ENTRIES][MAX_NAME_LENGTH + 1];
+	static size_t numScriptNames = 0;
+	static int32_t fpsLimit = 30;
 
-	// XInput is resolved at runtime so the plugin does not hard-depend on one specific XInput DLL,
-	// which would prevent the whole ASI from loading when that DLL is absent.
-	// The game itself links against xinput1_3.dll, so that one is tried first.
-	static void LoadXInput()
-	{
-		static const wchar_t* const XINPUT_DLLS[] = { L"xinput1_3.dll", L"xinput1_4.dll", L"xinput9_1_0.dll" };
-		for (const wchar_t* dllName : XINPUT_DLLS)
-		{
-			HMODULE hXInput = LoadLibraryW(dllName);
-			if (hXInput == nullptr)
-			{
-				continue;
-			}
-			pXInputGetState = reinterpret_cast<XInputGetStateFn>(GetProcAddress(hXInput, "XInputGetState"));
-			if (pXInputGetState != nullptr)
-			{
-				Log::Write("XInput loaded from %ls", dllName);
-				return;
-			}
-			FreeLibrary(hXInput);
-		}
-		Log::Write("No XInput DLL found, controller toggle unavailable");
-	}
+	static bool capLowered = false;
+	static int32_t savedCapOperand = 0;
 
-	// Reads FPSToggleValues, FPSToggleKey and FPSToggleController
+	// Reads ScriptFPSLimit and ScriptFPSLimitScripts
 	static void ReadSettings(const wchar_t* iniPath)
 	{
-		wchar_t buffer[128];
+		fpsLimit = GetPrivateProfileIntW(L"SilentPatch", L"ScriptFPSLimit", 30, iniPath);
 
-		// Comma separated list of caps to cycle through, 0 = uncapped
-		GetPrivateProfileStringW(L"SilentPatch", L"FPSToggleValues", L"30,60", buffer, _countof(buffer), iniPath);
-		numCycleValues = 0;
+		// Comma separated script names without extension - an empty list disables the feature
+		wchar_t buffer[1024];
+		GetPrivateProfileStringW(L"SilentPatch", L"ScriptFPSLimitScripts", L"ClassArt,ClassBiology,ClassChem,ClassEnglish,ClassGeography,ClassMath,ClassMusic,ClassPhoto,ClassShop,2_08,3_01A,3_01C,5_03,5_04", buffer, _countof(buffer), iniPath);
+		numScriptNames = 0;
 		const wchar_t* cursor = buffer;
-		while (*cursor != 0 && numCycleValues < MAX_CYCLE_VALUES)
+		while (*cursor != 0 && numScriptNames < MAX_LIST_ENTRIES)
 		{
-			wchar_t* end = nullptr;
-			const long value = wcstol(cursor, &end, 10);
-			if (end == cursor)
-			{
-				break; // Not a number
-			}
-			if (value >= 0)
-			{
-				cycleValues[numCycleValues++] = static_cast<int32_t>(value);
-			}
-			cursor = end;
 			while (*cursor == L',' || *cursor == L' ')
 			{
 				cursor++;
 			}
+			size_t length = 0;
+			while (cursor[length] != 0 && cursor[length] != L',' && cursor[length] != L' ')
+			{
+				length++;
+			}
+			if (length > 0 && length <= MAX_NAME_LENGTH)
+			{
+				char* name = scriptNames[numScriptNames++];
+				for (size_t i = 0; i < length; i++)
+				{
+					name[i] = static_cast<char>(cursor[i]); // Script names are plain ASCII
+				}
+				name[length] = 0;
+			}
+			cursor += length;
 		}
-		if (numCycleValues == 0)
-		{
-			cycleValues[0] = 30;
-			cycleValues[1] = 60;
-			numCycleValues = 2;
-		}
-
-		// Virtual-key code, decimal or 0x hex
-		GetPrivateProfileStringW(L"SilentPatch", L"FPSToggleKey", L"0x7A", buffer, _countof(buffer), iniPath);
-		wchar_t* end = nullptr;
-		const long key = wcstol(buffer, &end, 0);
-		toggleKey = (end == buffer || key < 0 || key > 0xFF) ? VK_F11 : static_cast<int>(key);
-
-		controllerToggle = GetPrivateProfileIntW(L"SilentPatch", L"FPSToggleController", 1, iniPath) != 0;
 	}
 
 	static bool IsEnabled()
 	{
-		return toggleKey != 0 || controllerToggle;
+		return fpsLimit > 0 && numScriptNames != 0;
 	}
 
-	static bool IsGameInForeground()
+	// Matches the script's file name against the list, ignoring any directory, extension and case
+	static bool IsListedScript(const char* scriptName)
 	{
-		HWND hForeground = GetForegroundWindow();
-		if (hForeground == nullptr)
+		const size_t nameLength = strnlen(scriptName, SCRIPT_NAME_SIZE);
+		size_t start = 0;
+		size_t end = nameLength;
+		for (size_t i = 0; i < nameLength; i++)
 		{
-			return false;
-		}
-		DWORD processId = 0;
-		GetWindowThreadProcessId(hForeground, &processId);
-		return processId == GetCurrentProcessId();
-	}
-
-	static bool IsControllerComboHeld()
-	{
-		if (!controllerToggle || pXInputGetState == nullptr)
-		{
-			return false;
-		}
-		XINPUT_STATE state = {};
-		if (pXInputGetState(0, &state) != ERROR_SUCCESS)
-		{
-			return false;
-		}
-		constexpr WORD COMBO = XINPUT_GAMEPAD_BACK | XINPUT_GAMEPAD_DPAD_DOWN;
-		return (state.Gamepad.wButtons & COMBO) == COMBO;
-	}
-
-	static bool IsKeyboardToggleHeld()
-	{
-		return toggleKey != 0 && (GetAsyncKeyState(toggleKey) & 0x8000) != 0;
-	}
-
-	// The cap operand stores INT_MAX for "uncapped", the INI and the cycle list use 0 for it
-	static int32_t CapToOperand(int32_t cap)
-	{
-		return cap > 0 ? cap : INT_MAX;
-	}
-
-	static int32_t OperandToCap(int32_t operand)
-	{
-		return operand == INT_MAX ? 0 : operand;
-	}
-
-	static void CycleFPSCap(const wchar_t* iniPath)
-	{
-		const int32_t currentCap = OperandToCap(*FPS_CAP_OPERAND);
-
-		// Move to the value after the current one, or to the first one if the current cap is not in the list
-		size_t nextIndex = 0;
-		for (size_t i = 0; i < numCycleValues; i++)
-		{
-			if (cycleValues[i] == currentCap)
+			if (scriptName[i] == '/' || scriptName[i] == '\\')
 			{
-				nextIndex = (i + 1) % numCycleValues;
-				break;
+				start = i + 1;
 			}
 		}
-		const int32_t newCap = cycleValues[nextIndex];
-		if (newCap == currentCap)
+		for (size_t i = start; i < nameLength; i++)
 		{
-			return;
+			if (scriptName[i] == '.')
+			{
+				end = i;
+			}
 		}
-
-		// Apply first - persisting to the INI can legitimately fail (e.g. read-only game directory)
-		// and that must not stop the in-game toggle from working
-		Memory::VP::Patch<int32_t>(FPS_CAP_OPERAND, CapToOperand(newCap));
-
-		wchar_t value[16];
-		swprintf_s(value, L"%d", newCap);
-		const BOOL persisted = WritePrivateProfileStringW(L"SilentPatch", L"FPSLimit", value, iniPath);
-		Log::Write("FPS cap changed from %d to %d (0 = uncapped), INI %s", currentCap, newCap, persisted != FALSE ? "updated" : "not writable");
+		const size_t length = end - start;
+		for (size_t i = 0; i < numScriptNames; i++)
+		{
+			if (strlen(scriptNames[i]) == length && _strnicmp(scriptNames[i], scriptName + start, length) == 0)
+			{
+				return true;
+			}
+		}
+		return false;
 	}
 
-	DWORD WINAPI InputThread(LPVOID /*lpParam*/)
+	static bool IsListedScriptRunning()
 	{
-		LoadXInput();
-
-		bool toggleWasHeld = false;
-		while (WaitForSingleObject(hShutdownEvent, 50) == WAIT_TIMEOUT)
+		const uint32_t numScripts = *reinterpret_cast<const uint32_t*>(SCRIPT_MANAGER + NUM_SCRIPTS_OFFSET);
+		const uint8_t* const* scripts = reinterpret_cast<const uint8_t* const*>(SCRIPT_MANAGER + SCRIPTS_OFFSET);
+		for (uint32_t i = 0; i < numScripts && i < MAX_SCRIPTS; i++)
 		{
-			// Track the held state regardless of focus so a press started elsewhere does not fire on alt-tab,
-			// but only act on it while the game is the foreground window
-			const bool toggleHeld = IsControllerComboHeld() || IsKeyboardToggleHeld();
-			if (toggleHeld && !toggleWasHeld && IsGameInForeground())
+			if (scripts[i] != nullptr && IsListedScript(reinterpret_cast<const char*>(scripts[i] + SCRIPT_NAME_OFFSET)))
 			{
-				CycleFPSCap(g_iniPath);
+				return true;
 			}
-			toggleWasHeld = toggleHeld;
 		}
-		return 0;
+		return false;
+	}
+
+	// Lowers the cap while a listed script is running and restores the previous cap once none is.
+	// Runs on the game thread right after the script manager updated (and removed finished) scripts.
+	static void ApplyCap()
+	{
+		const bool listedScriptRunning = IsListedScriptRunning();
+		if (listedScriptRunning && !capLowered)
+		{
+			const int32_t currentCap = *FPS_CAP_OPERAND;
+			if (currentCap > fpsLimit)
+			{
+				savedCapOperand = *FPS_CAP_OPERAND;
+				Memory::VP::Patch<int32_t>(FPS_CAP_OPERAND, fpsLimit);
+				capLowered = true;
+				Log::Write("Script FPS limit: cap lowered from %d to %d", currentCap, fpsLimit);
+			}
+		}
+		else if (!listedScriptRunning && capLowered)
+		{
+			Memory::VP::Patch<int32_t>(FPS_CAP_OPERAND, savedCapOperand);
+			capLowered = false;
+			Log::Write("Script FPS limit: cap restored to %d", savedCapOperand);
+		}
+	}
+
+	// CScriptManager::Update(bool) is thiscall - wrapped as fastcall with a dummy edx argument
+	static void (__fastcall *orgUpdateScripts)(void* scriptManager, int, bool);
+	static void __fastcall UpdateScripts_ApplyCap(void* scriptManager, int edx, bool arg)
+	{
+		orgUpdateScripts(scriptManager, edx, arg);
+		ApplyCap();
 	}
 }
 
@@ -1049,11 +1007,9 @@ void InjectHooks()
 		ReadCall(0x43D660, orgUpdateTimer);
 		InjectHook(0x43D660, UpdateTimerAndSleep);
 
-		// Because we're doing a busy loop now, 31FPS cap can now become a 30FPS cap.
-		// Defaults to 30 when the option is missing so the in-game toggle always has a known starting point.
-		const int fpsLimit = GetPrivateProfileIntW(L"SilentPatch", L"FPSLimit", 30, g_iniPath);
-		Patch<int32_t>(FPS_CAP_OPERAND, fpsLimit > 0 ? fpsLimit : INT_MAX);
-		Log::Write("FPSLimit=%d (0 = uncapped)", fpsLimit);
+		// The game runs at a fixed 60FPS - the cap is not configurable, the fixes below assume exactly 60
+		Patch<int32_t>(FPS_CAP_OPERAND, 60);
+		Log::Write("Frame rate cap: 60");
 
 		// Revert code changes 60FPS EXE does, we don't need them anymore
 		Patch<int8_t>(0x4061BE + 1, 0x4);
@@ -1499,20 +1455,45 @@ void InjectHooks()
 		InjectHook(0x5A9A1F, MDXactCreateSoundBankWithManagedDataCommand);
 	}
 
-	// In-game FPS cap toggle
-	FPSToggle::ReadSettings(g_iniPath);
-	if (FPSToggle::IsEnabled())
+	// Automatic FPS cap while scripts known to misbehave at high frame rates are running
+	ScriptFPSLimit::ReadSettings(g_iniPath);
+	if (ScriptFPSLimit::IsEnabled())
 	{
-		HANDLE hThread = CreateThread(nullptr, 0, FPSToggle::InputThread, nullptr, 0, nullptr);
-		if (hThread != nullptr)
+		using namespace ScriptFPSLimit;
+
+		// CScriptManager::Update is called directly from four places in the game loop - hook them all,
+		// but only if every site still looks like the expected call
+		static const uintptr_t UPDATE_CALL_SITES[] = { 0x42FABB, 0x42FDFB, 0x43007F, 0x43C98B };
+		bool codeMatches = true;
+		for (uintptr_t site : UPDATE_CALL_SITES)
 		{
-			CloseHandle(hThread);
+			uintptr_t target = 0;
+			if (MemEquals(site, { 0xE8 }))
+			{
+				ReadCall(site, target);
+			}
+			if (target != 0x5DBB40)
+			{
+				codeMatches = false;
+			}
 		}
-		Log::Write("FPS toggle enabled: key 0x%02X (0 = disabled), controller combo %s", FPSToggle::toggleKey, FPSToggle::controllerToggle ? "on" : "off");
+		if (codeMatches)
+		{
+			ReadCall(UPDATE_CALL_SITES[0], orgUpdateScripts);
+			for (uintptr_t site : UPDATE_CALL_SITES)
+			{
+				InjectHook(site, UpdateScripts_ApplyCap);
+			}
+			Log::Write("Script FPS limit %d enabled for %zu script(s)", fpsLimit, numScriptNames);
+		}
+		else
+		{
+			Log::Write("Script FPS limit requested but the script manager code did not match, not enabled");
+		}
 	}
 	else
 	{
-		Log::Write("FPS toggle disabled");
+		Log::Write("Script FPS limit disabled");
 	}
 
 	Log::Write("All fixes applied");
@@ -1606,15 +1587,7 @@ BOOL WINAPI DllMain(HINSTANCE hinstDLL, DWORD fdwReason, LPVOID lpvReserved)
 
 	if (fdwReason == DLL_PROCESS_ATTACH)
 	{
-		if (hShutdownEvent == NULL)
-		{
-			hShutdownEvent = CreateEvent(NULL, TRUE, FALSE, NULL);
-		}
 		hDLLModule = hinstDLL;
-	}
-	if (fdwReason == DLL_PROCESS_DETACH)
-	{
-		SetEvent(hShutdownEvent); // Signal the event
 	}
 	return TRUE;
 }

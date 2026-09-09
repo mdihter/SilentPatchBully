@@ -19,14 +19,13 @@ Fixes featured in this plugin:
 * Fixed handle leaks in audio code, preventing handles from accumulating during the game
 * Fixed several memory leaks in audio code, preventing out of memory crashes during extended play sessions
 * Made memory manager workarounds toggleable via the INI file - disabled by default, to be removed in the future
-* Frame Limiter has been made much more precise, so the game should lock at exactly 30FPS now
-  (as opposed to stock limiter being prone to dropping frames a lot)
+* Frame Limiter has been made much more precise and the game runs at a fixed 60FPS
+  (as opposed to the stock 30FPS limiter being prone to dropping frames a lot)
 * Fixed an issue where game would use more CPU than required when minimized
 
 ### Quality of life improvements
-* The FPS cap can be changed in SilentPatchBully.ini (30FPS by default) and cycled in game through a configurable
-  list of caps (30 and 60 by default) with SELECT + DPAD DOWN on a controller or F11 on the keyboard - both can be
-  rebound or disabled in the INI file
+* The game runs at 60FPS - scripts known to misbehave at that frame rate (classes and a few missions)
+  automatically lower the cap to 30FPS while they run and restore 60FPS afterwards, the list is configurable in the INI file
 * Automatic settings configuration (1080p with High Shadows by default) - settings are written to the game's registry
   settings whenever they change in the INI file, so changes made afterwards in the game's own options menu are left alone
 * An experimental frame limiter mode (`FrameLimiterSleep=1`) that sleeps instead of spinning between frames,
