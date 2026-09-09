@@ -26,7 +26,7 @@
     <ClInclude Include="PoolsBully.h">
       <Filter>Header Files</Filter>
     </ClInclude>
-    <ClInclude Include="ModUtils\MemoryMgr.h">
+    <ClInclude Include="Utils\MemoryMgr.h">
       <Filter>Header Files\Utils</Filter>
     </ClInclude>
     <ClInclude Include="DefaultControllerConfig.h">

@@ -1,21 +1,34 @@
 #define WIN32_LEAN_AND_MEAN
 #define NOMINMAX
 
-#define WINVER 0x0502
-#define _WIN32_WINNT 0x0502
+// Windows Vista is the minimum - CancelIoEx (used by the sndStream fix) is only declared by the SDK headers
+// when _WIN32_WINNT >= 0x0600, and it is imported from kernel32 unconditionally anyway
+#define WINVER 0x0600
+#define _WIN32_WINNT 0x0600
 
 #include <windows.h>
 #include <Xinput.h>
+#include <Shlwapi.h>
+#include <Shlobj.h>
+#include <mmsystem.h>
 
 #include "Utils/MemoryMgr.h"
 #include "PoolsBully.h"
 #include "DefaultControllerConfig.h"
 
 #include <cassert>
-
-#include <Shlwapi.h>
+#include <climits>
+#include <cstdarg>
+#include <cstdio>
+#include <cstdlib>
+#include <cstring>
+#include <cwchar>
+#include <functional>
+#include <memory>
 
 #pragma comment(lib, "shlwapi.lib")
+#pragma comment(lib, "shell32.lib")
+#pragma comment(lib, "winmm.lib")
 
 #ifndef NDEBUG
 
@@ -35,6 +48,75 @@
 
 static HINSTANCE hDLLModule;
 static HANDLE hShutdownEvent = NULL;
+
+// Path to SilentPatchBully.ini next to the ASI, filled in by InjectHooks before anything reads it
+static wchar_t g_iniPath[MAX_PATH];
+
+// Immediate operand of the instruction patched by the FPSLimit INI option - the FPS cap value, INT_MAX = uncapped
+static int32_t* const FPS_CAP_OPERAND = reinterpret_cast<int32_t*>(0x40618F + 1);
+
+// ============= Optional diagnostics log (LogFile=1 in the INI) =============
+namespace Log
+{
+	static HANDLE hLogFile = INVALID_HANDLE_VALUE;
+	static CRITICAL_SECTION logLock;
+
+	static void Init(const wchar_t* iniPath, bool enabled)
+	{
+		if (!enabled)
+		{
+			return;
+		}
+		InitializeCriticalSection(&logLock);
+
+		wchar_t logPath[MAX_PATH];
+		wcscpy_s(logPath, iniPath);
+		PathRenameExtensionW(logPath, L".log");
+		hLogFile = CreateFileW(logPath, GENERIC_WRITE, FILE_SHARE_READ, nullptr, CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
+	}
+
+	static bool IsEnabled()
+	{
+		return hLogFile != INVALID_HANDLE_VALUE;
+	}
+
+	// printf-style with a narrow format string, use %ls for wide strings
+	static void Write(const char* format, ...)
+	{
+		if (!IsEnabled())
+		{
+			return;
+		}
+
+		char line[1024];
+		SYSTEMTIME time;
+		GetLocalTime(&time);
+		const int prefixLength = sprintf_s(line, "[%02u:%02u:%02u.%03u] ", static_cast<unsigned>(time.wHour), static_cast<unsigned>(time.wMinute), static_cast<unsigned>(time.wSecond), static_cast<unsigned>(time.wMilliseconds));
+		if (prefixLength < 0)
+		{
+			return;
+		}
+		size_t length = static_cast<size_t>(prefixLength);
+
+		const size_t capacity = sizeof(line) - length - 2; // Leave room for the line break
+		va_list args;
+		va_start(args, format);
+		const int written = vsnprintf(line + length, capacity, format, args);
+		va_end(args);
+		if (written < 0)
+		{
+			return;
+		}
+		length += static_cast<size_t>(written) >= capacity ? capacity - 1 : static_cast<size_t>(written); // Truncates overlong lines
+		line[length++] = '\r';
+		line[length++] = '\n';
+
+		EnterCriticalSection(&logLock);
+		DWORD bytesWritten = 0;
+		WriteFile(hLogFile, line, static_cast<DWORD>(length), &bytesWritten, nullptr);
+		LeaveCriticalSection(&logLock);
+	}
+}
 
 namespace FixedAllocators
 {
@@ -167,6 +249,83 @@ namespace FrameTimingFix
 		Sleep(100);
 	}
 
+	// ===== Hybrid frame limiter wait (FrameLimiterSleep=1 in the INI) =====
+	// The game's limiter loops "while (frame is too short) Sleep(1);". By default SilentPatch removes the Sleep so the
+	// loop spins, which is precise but keeps a CPU core fully busy. This replacement for the Sleep call instead sleeps
+	// in short quanta while the estimated deadline is still far away and spins only for the last few milliseconds.
+	// The game re-checks its own timer after every call, so a wrong estimate can only cost a single quantum of overshoot.
+
+#ifndef CREATE_WAITABLE_TIMER_HIGH_RESOLUTION
+#define CREATE_WAITABLE_TIMER_HIGH_RESOLUTION 0x00000002
+#endif
+
+	static LONGLONG qpcFrequency = 0;
+	static HANDLE hWaitTimer = nullptr;
+	static LONGLONG waitQuantum100ns = 10000; // 1ms
+	static LONGLONG spinWindowTicks = 0;
+	static LONGLONG lastReturnTicks = 0;
+	static LONGLONG deadlineEstimateTicks = 0;
+
+	static LONGLONG Now()
+	{
+		LARGE_INTEGER counter;
+		QueryPerformanceCounter(&counter);
+		return counter.QuadPart;
+	}
+
+	static bool InitHybridWait()
+	{
+		LARGE_INTEGER frequency;
+		QueryPerformanceFrequency(&frequency);
+		qpcFrequency = frequency.QuadPart;
+
+		// High resolution timers (Windows 10 1803 and newer) wake up within roughly half a millisecond,
+		// older systems need timeBeginPeriod(1) and wake up within one to two milliseconds
+		hWaitTimer = CreateWaitableTimerExW(nullptr, nullptr, CREATE_WAITABLE_TIMER_HIGH_RESOLUTION, TIMER_ALL_ACCESS);
+		if (hWaitTimer != nullptr)
+		{
+			waitQuantum100ns = 5000; // 0.5ms
+			spinWindowTicks = (qpcFrequency * 2) / 1000; // Spin for the last 2ms
+		}
+		else
+		{
+			hWaitTimer = CreateWaitableTimerExW(nullptr, nullptr, 0, TIMER_ALL_ACCESS);
+			timeBeginPeriod(1);
+			waitQuantum100ns = 10000; // 1ms
+			spinWindowTicks = (qpcFrequency * 3) / 1000; // Spin for the last 3ms
+		}
+		return hWaitTimer != nullptr;
+	}
+
+	// Replaces the Sleep(1) call inside the game's frame limiter loop (cdecl, no arguments - the original push is removed too)
+	void HybridWait()
+	{
+		const LONGLONG now = Now();
+
+		// A gap since the last return means the game rendered a frame in between, so this is a new limiter session
+		// whose deadline is one frame period after the previous session ended. Calls within a session are back to back.
+		if (now - lastReturnTicks > qpcFrequency / 5000) // 0.2ms
+		{
+			const int32_t fpsCap = *FPS_CAP_OPERAND;
+			deadlineEstimateTicks = fpsCap > 0 ? lastReturnTicks + qpcFrequency / fpsCap : now;
+		}
+
+		if (deadlineEstimateTicks - now > spinWindowTicks)
+		{
+			LARGE_INTEGER dueTime;
+			dueTime.QuadPart = -waitQuantum100ns; // Negative = relative
+			if (SetWaitableTimer(hWaitTimer, &dueTime, 0, nullptr, nullptr, FALSE) != FALSE)
+			{
+				WaitForSingleObject(hWaitTimer, INFINITE);
+			}
+		}
+		else
+		{
+			YieldProcessor();
+		}
+
+		lastReturnTicks = Now();
+	}
 }
 
 #ifdef _DEBUG
@@ -443,104 +602,350 @@ namespace SEALeaksFix
 };
 
 
-DWORD WINAPI InputThread(LPVOID lpParam) {
-	UNREFERENCED_PARAMETER(lpParam);
-	int32_t* fps_cap = (int32_t*)0x406190;
-	XINPUT_STATE xstate = { 0 };
-	bool CordHeld = false;
-	bool KeyHeld = false;
-	while (WaitForSingleObject(hShutdownEvent, 100) == WAIT_TIMEOUT)
+// RegSetKeyValueW only exists from Windows Vista onwards, this equivalent relies on APIs present since Windows 2000
+static LSTATUS RegSetKeyValueWLegacy(HKEY hKey, LPCWSTR lpSubKey, LPCWSTR lpValueName, DWORD dwType, LPCVOID lpData, DWORD cbData)
+{
+	HKEY hTargetKey = hKey;
+	const bool hasSubKey = lpSubKey != nullptr && *lpSubKey != 0;
+	if (hasSubKey)
 	{
-		if (XInputGetState(0, &xstate) == ERROR_SUCCESS || !KeyHeld)
+		const LSTATUS status = RegCreateKeyExW(hKey, lpSubKey, 0, nullptr, REG_OPTION_NON_VOLATILE, KEY_SET_VALUE, nullptr, &hTargetKey, nullptr);
+		if (status != ERROR_SUCCESS)
 		{
-			if (xstate.Gamepad.wButtons & XINPUT_GAMEPAD_BACK &&
-				xstate.Gamepad.wButtons & XINPUT_GAMEPAD_DPAD_DOWN &&
-				!CordHeld || ((GetAsyncKeyState(VK_F11) & 0x01) && !KeyHeld))
-			{
-				KeyHeld = true;
-				wchar_t			wcModulePath[MAX_PATH];
-				GetModuleFileNameW(hDLLModule, wcModulePath, _countof(wcModulePath) - 3); // Minus max required space for extension
-				PathRenameExtensionW(wcModulePath, L".ini");
-
-				if (const int INIoption = GetPrivateProfileIntW(L"SilentPatch", L"FPSLimit", -1, wcModulePath); INIoption != -1)
-				{
-					if (INIoption == 60)
-					{
-						if (WritePrivateProfileStringW(L"SilentPatch", L"FPSLimit", L"30", wcModulePath))
-						{
-							DWORD dwOldProtect;
-							if (VirtualProtect(fps_cap, sizeof(int32_t), PAGE_EXECUTE_READWRITE, &dwOldProtect))
-							{
-								*(fps_cap) = 30;
-								VirtualProtect(fps_cap, sizeof(int32_t), dwOldProtect, &dwOldProtect);
-							}
-						}
-					}
-					if (INIoption == 30)
-					{
-						if (WritePrivateProfileStringW(L"SilentPatch", L"FPSLimit", L"60", wcModulePath))
-						{
-							DWORD dwOldProtect;
-							if (VirtualProtect(fps_cap, sizeof(int32_t), PAGE_EXECUTE_READWRITE, &dwOldProtect))
-							{
-								*(fps_cap) = 60;
-								VirtualProtect(fps_cap, sizeof(int32_t), dwOldProtect, &dwOldProtect);
-							}
-						}
-					}
-
-				}
-				if (xstate.Gamepad.wButtons & XINPUT_GAMEPAD_BACK &&
-					xstate.Gamepad.wButtons & XINPUT_GAMEPAD_DPAD_DOWN)
-				{
-					CordHeld = true;
-				}
-			}
-			if (!(xstate.Gamepad.wButtons & XINPUT_GAMEPAD_BACK) ||
-				!(xstate.Gamepad.wButtons & XINPUT_GAMEPAD_DPAD_DOWN))
-			{
-				CordHeld = false;
-			}
-
-		}
-		if (!GetAsyncKeyState(VK_F11) && KeyHeld)
-		{
-			KeyHeld = false;
+			return status;
 		}
 	}
-	return 0; // Return value of the thread
+
+	const LSTATUS status = RegSetValueExW(hTargetKey, lpValueName, 0, dwType, static_cast<const BYTE*>(lpData), cbData);
+
+	if (hasSubKey)
+	{
+		RegCloseKey(hTargetKey);
+	}
+	return status;
 }
 
-LSTATUS RegSetKeyValueWLegacy(
-	HKEY    hKey,
-	LPCWSTR lpSubKey,
-	LPCWSTR lpValueName,
-	DWORD   dwType,
-	LPCVOID lpData,
-	DWORD   cbData
-)
+// ============= Automatic game settings from the INI =============
+namespace GameSettings
 {
-	LSTATUS Status;
+	// Where the game keeps its own settings, and where SilentPatch remembers what it last wrote there
+	static const wchar_t* const GAME_KEY_PATH = L"Software\\Rockstar Games\\Bully Scholarship Edition\\A0";
+	static const wchar_t* const LAST_APPLIED_KEY_PATH = L"Software\\SilentPatch\\Bully Scholarship Edition\\LastApplied";
 
-	if (lpSubKey && *lpSubKey)
+	struct Setting
 	{
-		Status = RegCreateKeyExW(hKey, lpSubKey, 0, 0, 0, KEY_SET_VALUE, 0, &hKey, 0);
+		const wchar_t* iniKey;
+		const wchar_t* registryValue;
+	};
 
-		if (Status != NOERROR)
+	static const Setting SETTINGS[] =
+	{
+		{ L"AntiAliasing", L"AA" },
+		{ L"ResolutionWidth", L"RESW" },
+		{ L"ResolutionHeight", L"RESH" },
+		{ L"ShadowLevel", L"SHA" },
+		{ L"Vsync", L"VS" },
+		{ L"Windowed", L"WIN" },
+	};
+
+	static bool ReadDword(LPCWSTR keyPath, LPCWSTR valueName, DWORD& value)
+	{
+		DWORD size = sizeof(value);
+		return RegGetValueW(HKEY_CURRENT_USER, keyPath, valueName, RRF_RT_REG_DWORD, nullptr, &value, &size) == ERROR_SUCCESS;
+	}
+
+	// Writes each setting present in the INI to the game's registry settings, but only when the INI value changed
+	// since SilentPatch last applied it - so changes made later in the game's own options menu are left alone.
+	// AlwaysApplySettings=1 restores the old behaviour of writing them on every launch.
+	static void Apply(const wchar_t* iniPath)
+	{
+		const bool alwaysApply = GetPrivateProfileIntW(L"SilentPatch", L"AlwaysApplySettings", 0, iniPath) != 0;
+
+		for (const Setting& setting : SETTINGS)
 		{
-			return Status;
+			const int iniValue = GetPrivateProfileIntW(L"SilentPatch", setting.iniKey, -1, iniPath);
+			if (iniValue == -1)
+			{
+				continue;
+			}
+			const DWORD value = static_cast<DWORD>(iniValue);
+
+			DWORD lastApplied = 0;
+			if (!alwaysApply && ReadDword(LAST_APPLIED_KEY_PATH, setting.registryValue, lastApplied) && lastApplied == value)
+			{
+				Log::Write("%ls=%d unchanged since last applied, leaving the game's %ls setting alone", setting.iniKey, iniValue, setting.registryValue);
+				continue;
+			}
+
+			const LSTATUS status = RegSetKeyValueWLegacy(HKEY_CURRENT_USER, GAME_KEY_PATH, setting.registryValue, REG_DWORD, &value, sizeof(value));
+			if (status == ERROR_SUCCESS)
+			{
+				RegSetKeyValueWLegacy(HKEY_CURRENT_USER, LAST_APPLIED_KEY_PATH, setting.registryValue, REG_DWORD, &value, sizeof(value));
+			}
+			Log::Write("%ls=%d written to registry value %ls (status %ld)", setting.iniKey, iniValue, setting.registryValue, static_cast<long>(status));
 		}
 	}
+}
 
-	Status = RegSetValueExW(hKey, lpValueName, 0, dwType,
-		static_cast<PBYTE>(const_cast<void*>(lpData)), cbData);
+// ============= In-game FPS cap toggle (SELECT + DPAD DOWN on a controller, F11 on the keyboard by default) =============
+namespace FPSToggle
+{
+	static constexpr size_t MAX_CYCLE_VALUES = 8;
+	static int32_t cycleValues[MAX_CYCLE_VALUES] = { 30, 60 };
+	static size_t numCycleValues = 2;
+	static int toggleKey = VK_F11;       // Virtual-key code, 0 disables the keyboard toggle
+	static bool controllerToggle = true; // false disables the controller combo
 
-	if (lpSubKey && *lpSubKey)
+	using XInputGetStateFn = DWORD (WINAPI*)(DWORD dwUserIndex, XINPUT_STATE* pState);
+	static XInputGetStateFn pXInputGetState = nullptr;
+
+	// XInput is resolved at runtime so the plugin does not hard-depend on one specific XInput DLL,
+	// which would prevent the whole ASI from loading when that DLL is absent.
+	// The game itself links against xinput1_3.dll, so that one is tried first.
+	static void LoadXInput()
 	{
-		RegCloseKey(hKey);
+		static const wchar_t* const XINPUT_DLLS[] = { L"xinput1_3.dll", L"xinput1_4.dll", L"xinput9_1_0.dll" };
+		for (const wchar_t* dllName : XINPUT_DLLS)
+		{
+			HMODULE hXInput = LoadLibraryW(dllName);
+			if (hXInput == nullptr)
+			{
+				continue;
+			}
+			pXInputGetState = reinterpret_cast<XInputGetStateFn>(GetProcAddress(hXInput, "XInputGetState"));
+			if (pXInputGetState != nullptr)
+			{
+				Log::Write("XInput loaded from %ls", dllName);
+				return;
+			}
+			FreeLibrary(hXInput);
+		}
+		Log::Write("No XInput DLL found, controller toggle unavailable");
 	}
 
-	return Status;
+	// Reads FPSToggleValues, FPSToggleKey and FPSToggleController
+	static void ReadSettings(const wchar_t* iniPath)
+	{
+		wchar_t buffer[128];
+
+		// Comma separated list of caps to cycle through, 0 = uncapped
+		GetPrivateProfileStringW(L"SilentPatch", L"FPSToggleValues", L"30,60", buffer, _countof(buffer), iniPath);
+		numCycleValues = 0;
+		const wchar_t* cursor = buffer;
+		while (*cursor != 0 && numCycleValues < MAX_CYCLE_VALUES)
+		{
+			wchar_t* end = nullptr;
+			const long value = wcstol(cursor, &end, 10);
+			if (end == cursor)
+			{
+				break; // Not a number
+			}
+			if (value >= 0)
+			{
+				cycleValues[numCycleValues++] = static_cast<int32_t>(value);
+			}
+			cursor = end;
+			while (*cursor == L',' || *cursor == L' ')
+			{
+				cursor++;
+			}
+		}
+		if (numCycleValues == 0)
+		{
+			cycleValues[0] = 30;
+			cycleValues[1] = 60;
+			numCycleValues = 2;
+		}
+
+		// Virtual-key code, decimal or 0x hex
+		GetPrivateProfileStringW(L"SilentPatch", L"FPSToggleKey", L"0x7A", buffer, _countof(buffer), iniPath);
+		wchar_t* end = nullptr;
+		const long key = wcstol(buffer, &end, 0);
+		toggleKey = (end == buffer || key < 0 || key > 0xFF) ? VK_F11 : static_cast<int>(key);
+
+		controllerToggle = GetPrivateProfileIntW(L"SilentPatch", L"FPSToggleController", 1, iniPath) != 0;
+	}
+
+	static bool IsEnabled()
+	{
+		return toggleKey != 0 || controllerToggle;
+	}
+
+	static bool IsGameInForeground()
+	{
+		HWND hForeground = GetForegroundWindow();
+		if (hForeground == nullptr)
+		{
+			return false;
+		}
+		DWORD processId = 0;
+		GetWindowThreadProcessId(hForeground, &processId);
+		return processId == GetCurrentProcessId();
+	}
+
+	static bool IsControllerComboHeld()
+	{
+		if (!controllerToggle || pXInputGetState == nullptr)
+		{
+			return false;
+		}
+		XINPUT_STATE state = {};
+		if (pXInputGetState(0, &state) != ERROR_SUCCESS)
+		{
+			return false;
+		}
+		constexpr WORD COMBO = XINPUT_GAMEPAD_BACK | XINPUT_GAMEPAD_DPAD_DOWN;
+		return (state.Gamepad.wButtons & COMBO) == COMBO;
+	}
+
+	static bool IsKeyboardToggleHeld()
+	{
+		return toggleKey != 0 && (GetAsyncKeyState(toggleKey) & 0x8000) != 0;
+	}
+
+	// The cap operand stores INT_MAX for "uncapped", the INI and the cycle list use 0 for it
+	static int32_t CapToOperand(int32_t cap)
+	{
+		return cap > 0 ? cap : INT_MAX;
+	}
+
+	static int32_t OperandToCap(int32_t operand)
+	{
+		return operand == INT_MAX ? 0 : operand;
+	}
+
+	static void CycleFPSCap(const wchar_t* iniPath)
+	{
+		const int32_t currentCap = OperandToCap(*FPS_CAP_OPERAND);
+
+		// Move to the value after the current one, or to the first one if the current cap is not in the list
+		size_t nextIndex = 0;
+		for (size_t i = 0; i < numCycleValues; i++)
+		{
+			if (cycleValues[i] == currentCap)
+			{
+				nextIndex = (i + 1) % numCycleValues;
+				break;
+			}
+		}
+		const int32_t newCap = cycleValues[nextIndex];
+		if (newCap == currentCap)
+		{
+			return;
+		}
+
+		// Apply first - persisting to the INI can legitimately fail (e.g. read-only game directory)
+		// and that must not stop the in-game toggle from working
+		Memory::VP::Patch<int32_t>(FPS_CAP_OPERAND, CapToOperand(newCap));
+
+		wchar_t value[16];
+		swprintf_s(value, L"%d", newCap);
+		const BOOL persisted = WritePrivateProfileStringW(L"SilentPatch", L"FPSLimit", value, iniPath);
+		Log::Write("FPS cap changed from %d to %d (0 = uncapped), INI %s", currentCap, newCap, persisted != FALSE ? "updated" : "not writable");
+	}
+
+	DWORD WINAPI InputThread(LPVOID /*lpParam*/)
+	{
+		LoadXInput();
+
+		bool toggleWasHeld = false;
+		while (WaitForSingleObject(hShutdownEvent, 50) == WAIT_TIMEOUT)
+		{
+			// Track the held state regardless of focus so a press started elsewhere does not fire on alt-tab,
+			// but only act on it while the game is the foreground window
+			const bool toggleHeld = IsControllerComboHeld() || IsKeyboardToggleHeld();
+			if (toggleHeld && !toggleWasHeld && IsGameInForeground())
+			{
+				CycleFPSCap(g_iniPath);
+			}
+			toggleWasHeld = toggleHeld;
+		}
+		return 0;
+	}
+}
+
+// ============= ControllerSettings file handling for the EnableControllers INI option =============
+namespace ControllerSettings
+{
+	static constexpr DWORD SETTINGS_FILE_SIZE = sizeof(EnabledControllerSettings);
+	static constexpr size_t CONTROLLERS_ENABLED_OFFSET = 0xA8;
+
+	static_assert(sizeof(DisabledControllerSettings) == SETTINGS_FILE_SIZE, "Controller settings templates must match in size");
+
+	static bool GetSettingsPath(wchar_t (&path)[MAX_PATH])
+	{
+		// The game keeps this file under the Documents folder of the current user. Ask the shell for it so that
+		// folder redirection (e.g. OneDrive) is respected, unlike a hardcoded %USERPROFILE%\Documents
+		if (FAILED(SHGetFolderPathW(nullptr, CSIDL_PERSONAL, nullptr, SHGFP_TYPE_CURRENT, path)))
+		{
+			return false;
+		}
+		if (!PathAppendW(path, L"Bully Scholarship Edition"))
+		{
+			return false;
+		}
+		CreateDirectoryW(path, nullptr); // Fails harmlessly if it already exists
+		return PathAppendW(path, L"ControllerSettings") != FALSE;
+	}
+
+	static bool ReadSettings(const wchar_t* path, unsigned char (&buffer)[SETTINGS_FILE_SIZE])
+	{
+		HANDLE hFile = CreateFileW(path, GENERIC_READ, FILE_SHARE_READ, nullptr, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
+		if (hFile == INVALID_HANDLE_VALUE)
+		{
+			return false;
+		}
+
+		DWORD bytesRead = 0;
+		const bool result = GetFileSize(hFile, nullptr) == SETTINGS_FILE_SIZE
+			&& ReadFile(hFile, buffer, SETTINGS_FILE_SIZE, &bytesRead, nullptr) != FALSE
+			&& bytesRead == SETTINGS_FILE_SIZE;
+		CloseHandle(hFile);
+		return result;
+	}
+
+	static bool WriteSettings(const wchar_t* path, const unsigned char (&buffer)[SETTINGS_FILE_SIZE])
+	{
+		HANDLE hFile = CreateFileW(path, GENERIC_WRITE, FILE_SHARE_READ, nullptr, CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
+		if (hFile == INVALID_HANDLE_VALUE)
+		{
+			return false;
+		}
+
+		DWORD bytesWritten = 0;
+		const bool result = WriteFile(hFile, buffer, SETTINGS_FILE_SIZE, &bytesWritten, nullptr) != FALSE
+			&& bytesWritten == SETTINGS_FILE_SIZE;
+		CloseHandle(hFile);
+		return result;
+	}
+
+	static void Apply(bool enableControllers)
+	{
+		wchar_t path[MAX_PATH];
+		if (!GetSettingsPath(path))
+		{
+			Log::Write("EnableControllers: could not resolve the ControllerSettings path");
+			return;
+		}
+
+		unsigned char settings[SETTINGS_FILE_SIZE];
+		const bool hasValidFile = ReadSettings(path, settings);
+		if (!hasValidFile)
+		{
+			// Missing or malformed file - start from the matching defaults
+			memcpy(settings, enableControllers ? EnabledControllerSettings : DisabledControllerSettings, SETTINGS_FILE_SIZE);
+		}
+
+		const unsigned char value = static_cast<unsigned char>(enableControllers ? 1 : 0);
+		if (hasValidFile && settings[CONTROLLERS_ENABLED_OFFSET] == value)
+		{
+			Log::Write("EnableControllers=%d already set in %ls", value, path);
+			return; // Already up to date, leave the file untouched
+		}
+		settings[CONTROLLERS_ENABLED_OFFSET] = value;
+		const bool written = WriteSettings(path, settings);
+		Log::Write("EnableControllers=%d %s to %ls%s", value, written ? "written" : "could not be written", path, hasValidFile ? "" : " (file was missing or malformed, defaults used)");
+	}
 }
 
 
@@ -548,9 +953,17 @@ void InjectHooks()
 {
 	using namespace Memory;
 
+	// Obtain a path to the INI next to the ASI
+	GetModuleFileNameW(hDLLModule, g_iniPath, _countof(g_iniPath) - 3); // Minus max required space for extension
+	PathRenameExtensionW(g_iniPath, L".ini");
+
+	Log::Init(g_iniPath, GetPrivateProfileIntW(L"SilentPatch", L"LogFile", 0, g_iniPath) != 0);
+	Log::Write("SilentPatch for Bully build %d.%d, INI: %ls", SILENTPATCH_REVISION_ID, SILENTPATCH_BUILD_ID, g_iniPath);
+
 	// If it's not 1.200, bail out
 	if (!MemEquals(0x860C6B, { 0xC7, 0x45, 0xFC, 0xFE, 0xFF, 0xFF, 0xFF }))
 	{
+		Log::Write("Unsupported executable (not 1.200), no fixes applied");
 #ifndef _DEBUG
 		MessageBoxW(nullptr, L"You are using an executable version not supported by SilentPatch (most likely 1.154)!\n\n"
 			L"I strongly recommend obtaining a 1.200 executable - if you are using a retail version, just download an official 1.200 patch; "
@@ -559,19 +972,15 @@ void InjectHooks()
 #endif
 		return;
 	}
+	Log::Write("Executable 1.200 detected, applying fixes");
 
 	std::unique_ptr<ScopedUnprotect::Unprotect> Protect = ScopedUnprotect::UnprotectSectionOrFullModule(GetModuleHandle(nullptr), ".text");
 
-	// Obtain a path to the ASI
-	wchar_t			wcModulePath[MAX_PATH];
-	LPCWSTR keyPath = L"Software\\Rockstar Games\\Bully Scholarship Edition\\A0"; // Path to the key
-	GetModuleFileNameW(hDLLModule, wcModulePath, _countof(wcModulePath) - 3); // Minus max required space for extension
-	PathRenameExtensionW(wcModulePath, L".ini");
-
 	// Replaced custom CMemoryHeap with regular CRT functions (like in GTA)
-	if (const int INIoption = GetPrivateProfileIntW(L"SilentPatch", L"CustomMemoryMgr", 0, wcModulePath); INIoption != 0)
+	if (const int INIoption = GetPrivateProfileIntW(L"SilentPatch", L"CustomMemoryMgr", 0, g_iniPath); INIoption != 0)
 	{
 		using namespace FixedAllocators;
+		Log::Write("CustomMemoryMgr enabled");
 
 		InjectHook(0x5EE630, InitMemoryMgr, PATCH_JUMP);
 		InjectHook(0x5EE5A0, ShutDownMemoryMgr, PATCH_JUMP);
@@ -612,155 +1021,51 @@ void InjectHooks()
 	{
 		using namespace FrameTimingFix;
 
-		// DO NOT sleep when limiting FPS in game...
-		Nop(0x4061C4, 2 + 6);
+		// The limiter loop calls Sleep(1) between timer checks. Either replace that call with the hybrid sleep/spin wait
+		// (FrameLimiterSleep=1), or remove it so the loop spins (default, most precise but keeps a CPU core busy)
+		bool hybridWait = false;
+		if (GetPrivateProfileIntW(L"SilentPatch", L"FrameLimiterSleep", 0, g_iniPath) != 0)
+		{
+			// push imm8 / call dword ptr [Sleep] - verify before touching it
+			if (MemEquals(0x4061C4, { 0x6A }) && MemEquals(0x4061C6, { 0xFF, 0x15 }) && InitHybridWait())
+			{
+				InjectHook(0x4061C4, HybridWait, PATCH_CALL);
+				Nop(0x4061C9, 3);
+				hybridWait = true;
+			}
+			else
+			{
+				Log::Write("FrameLimiterSleep requested but the limiter code did not match or the timer could not be created, spinning instead");
+			}
+		}
+		if (!hybridWait)
+		{
+			// DO NOT sleep when limiting FPS in game...
+			Nop(0x4061C4, 2 + 6);
+		}
+		Log::Write("Frame limiter wait: %s", hybridWait ? "hybrid sleep/spin" : "spin");
 
 		// ...sleep for 100ms periodically when minimized
 		ReadCall(0x43D660, orgUpdateTimer);
 		InjectHook(0x43D660, UpdateTimerAndSleep);
 
-		// Because we're doing a busy loop now, 31FPS cap can now become a 30FPS cap
-		if (const int INIoption = GetPrivateProfileIntW(L"SilentPatch", L"FPSLimit", -1, wcModulePath); INIoption != -1)
-		{
-			Patch<int32_t>(0x40618F + 1, INIoption > 0 ? INIoption : INT_MAX);
-		}
+		// Because we're doing a busy loop now, 31FPS cap can now become a 30FPS cap.
+		// Defaults to 30 when the option is missing so the in-game toggle always has a known starting point.
+		const int fpsLimit = GetPrivateProfileIntW(L"SilentPatch", L"FPSLimit", 30, g_iniPath);
+		Patch<int32_t>(FPS_CAP_OPERAND, fpsLimit > 0 ? fpsLimit : INT_MAX);
+		Log::Write("FPSLimit=%d (0 = uncapped)", fpsLimit);
 
-		if (const int INIoption = GetPrivateProfileIntW(L"SilentPatch", L"AntiAliasing", -1, wcModulePath); INIoption != -1)
-		{
-			LPCWSTR valueNameResH = L"AA";          // Name of the value
-			RegSetKeyValueWLegacy(
-				HKEY_CURRENT_USER, // Root key handle
-				keyPath,           // Subkey path
-				valueNameResH,         // Value name
-				REG_DWORD,         // Value type
-				&INIoption,        // Pointer to the data
-				sizeof(INIoption)  // Size of the data in bytes
-			);
-		}
-
-		if (const int INIoption = GetPrivateProfileIntW(L"SilentPatch", L"ResolutionHeight", -1, wcModulePath); INIoption != -1)
-		{
-			LPCWSTR valueNameResH = L"RESH";          // Name of the value
-			RegSetKeyValueWLegacy(
-				HKEY_CURRENT_USER, // Root key handle
-				keyPath,           // Subkey path
-				valueNameResH,         // Value name
-				REG_DWORD,         // Value type
-				&INIoption,        // Pointer to the data
-				sizeof(INIoption)  // Size of the data in bytes
-			);
-		}
-
-		if (const int INIoption = GetPrivateProfileIntW(L"SilentPatch", L"ResolutionWidth", -1, wcModulePath); INIoption != -1)
-		{
-			LPCWSTR valueNameResW = L"RESW";          // Name of the value
-			RegSetKeyValueWLegacy(
-				HKEY_CURRENT_USER, // Root key handle
-				keyPath,           // Subkey path
-				valueNameResW,         // Value name
-				REG_DWORD,         // Value type
-				&INIoption,        // Pointer to the data
-				sizeof(INIoption)  // Size of the data in bytes
-			);
-		}
-
-		if (const int INIoption = GetPrivateProfileIntW(L"SilentPatch", L"ShadowLevel", -1, wcModulePath); INIoption != -1)
-		{
-			LPCWSTR valueNameShadow = L"SHA";          // Name of the value
-			RegSetKeyValueWLegacy(
-				HKEY_CURRENT_USER, // Root key handle
-				keyPath,           // Subkey path
-				valueNameShadow,         // Value name
-				REG_DWORD,         // Value type
-				&INIoption,        // Pointer to the data
-				sizeof(INIoption)  // Size of the data in bytes
-			);
-		}
-
-		if (const int INIoption = GetPrivateProfileIntW(L"SilentPatch", L"Vsync", -1, wcModulePath); INIoption != -1)
-		{
-			LPCWSTR valueNameResH = L"VS";          // Name of the value
-			RegSetKeyValueWLegacy(
-				HKEY_CURRENT_USER, // Root key handle
-				keyPath,           // Subkey path
-				valueNameResH,         // Value name
-				REG_DWORD,         // Value type
-				&INIoption,        // Pointer to the data
-				sizeof(INIoption)  // Size of the data in bytes
-			);
-		}
-
-		if (const int INIoption = GetPrivateProfileIntW(L"SilentPatch", L"Windowed", -1, wcModulePath); INIoption != -1)
-		{
-			LPCWSTR valueNameResH = L"WIN";          // Name of the value
-			RegSetKeyValueWLegacy(
-				HKEY_CURRENT_USER, // Root key handle
-				keyPath,           // Subkey path
-				valueNameResH,         // Value name
-				REG_DWORD,         // Value type
-				&INIoption,        // Pointer to the data
-				sizeof(INIoption)  // Size of the data in bytes
-			);
-		}
-
-		if (const int INIoption = GetPrivateProfileIntW(L"SilentPatch", L"EnableControllers", -1, wcModulePath); INIoption != -1)
-		{
-			if (INIoption == 1 || INIoption == 0)
-			{
-				WCHAR configPath[MAX_PATH] = { 0 };
-				if (ExpandEnvironmentStringsW(L"%USERPROFILE%\\Documents\\Bully Scholarship Edition\\ControllerSettings", configPath, MAX_PATH))
-				{
-					HANDLE hFile = CreateFileW(configPath, GENERIC_READ, FILE_SHARE_READ, NULL, OPEN_EXISTING, 0, NULL);
-					if (hFile != INVALID_HANDLE_VALUE)
-					{
-						DWORD fs = GetFileSize(hFile, NULL);
-						if (fs == 236)
-						{
-							UCHAR dataBuffer[236] = { 0 };
-							if (ReadFile(hFile, dataBuffer, fs, 0, NULL))
-							{
-								CloseHandle(hFile);
-								if (dataBuffer[0xA8] != (UCHAR)INIoption)
-								{
-									dataBuffer[0xA8] = (UCHAR)INIoption;
-									HANDLE hFileNew = CreateFileW(configPath, GENERIC_WRITE, FILE_SHARE_READ, NULL, CREATE_ALWAYS, 0, NULL);
-									hFile = NULL;
-									if (hFileNew != INVALID_HANDLE_VALUE)
-									{
-										WriteFile(hFileNew, dataBuffer, ARRAYSIZE(dataBuffer), 0, NULL);
-										CloseHandle(hFileNew);
-									}
-								}
-							}
-						}
-						else
-						{
-							CloseHandle(hFile);
-							hFile = NULL;
-							HANDLE hFileNew = CreateFileW(configPath, GENERIC_WRITE, FILE_SHARE_READ, NULL, CREATE_ALWAYS, 0, NULL);
-							if (hFileNew != INVALID_HANDLE_VALUE)
-							{
-								WriteFile(hFileNew, (INIoption == 0) ? DisabledControllerSettings : EnabledControllerSettings, ARRAYSIZE(EnabledControllerSettings), 0, NULL);
-								CloseHandle(hFileNew);
-							}
-						}
-
-					}
-					else
-					{
-						HANDLE hFileNew = CreateFileW(configPath, FILE_WRITE_DATA, FILE_SHARE_READ, NULL, CREATE_ALWAYS, 0, NULL);
-						if (hFileNew != INVALID_HANDLE_VALUE)
-						{
-							WriteFile(hFileNew, (INIoption == 0) ? DisabledControllerSettings : EnabledControllerSettings, ARRAYSIZE(EnabledControllerSettings), 0, NULL);
-							CloseHandle(hFileNew);
-						}
-					}
-				}
-			}
-		}
 		// Revert code changes 60FPS EXE does, we don't need them anymore
 		Patch<int8_t>(0x4061BE + 1, 0x4);
 		Patch<uint8_t>(0x4061C2, 0x73);
+	}
+
+	// Game settings from the INI, written to the registry only when they changed since they were last applied
+	GameSettings::Apply(g_iniPath);
+
+	if (const int INIoption = GetPrivateProfileIntW(L"SilentPatch", L"EnableControllers", -1, g_iniPath); INIoption == 0 || INIoption == 1)
+	{
+		ControllerSettings::Apply(INIoption == 1);
 	}
 
 	// Remove FILE_FLAG_NO_BUFFERING from CdStreams
@@ -1193,22 +1498,24 @@ void InjectHooks()
 		ReadCall(0x5A9A1F, MDXactCreateSoundBankCommand);
 		InjectHook(0x5A9A1F, MDXactCreateSoundBankWithManagedDataCommand);
 	}
-	HANDLE hThread;      // Handle to the newly created thread
-	DWORD dwThreadId;    // ID of the newly created thread
 
-	// Create a new thread that will execute InputThread.
-	hThread = CreateThread(
-		nullptr,             // Default security attributes (can be NULL)
-		0,                   // Default stack size (0 means use default size)
-		InputThread,    // Pointer to the thread function
-		NULL,//(LPVOID)(*(int32_t *)0x40618F + 1),             // Parameter to pass to the thread function (can be NULL)
-		0,                   // Default creation flags (0 means run immediately)
-		&dwThreadId          // Pointer to a DWORD to receive the thread ID
-	);
-	if (hThread)
+	// In-game FPS cap toggle
+	FPSToggle::ReadSettings(g_iniPath);
+	if (FPSToggle::IsEnabled())
 	{
-		CloseHandle(hThread);
+		HANDLE hThread = CreateThread(nullptr, 0, FPSToggle::InputThread, nullptr, 0, nullptr);
+		if (hThread != nullptr)
+		{
+			CloseHandle(hThread);
+		}
+		Log::Write("FPS toggle enabled: key 0x%02X (0 = disabled), controller combo %s", FPSToggle::toggleKey, FPSToggle::controllerToggle ? "on" : "off");
 	}
+	else
+	{
+		Log::Write("FPS toggle disabled");
+	}
+
+	Log::Write("All fixes applied");
 }
 
 static void ProcHook()
@@ -1295,7 +1602,6 @@ static void InstallHooks()
 
 BOOL WINAPI DllMain(HINSTANCE hinstDLL, DWORD fdwReason, LPVOID lpvReserved)
 {
-	UNREFERENCED_PARAMETER(hinstDLL);
 	UNREFERENCED_PARAMETER(lpvReserved);
 
 	if (fdwReason == DLL_PROCESS_ATTACH)

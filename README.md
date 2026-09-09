@@ -24,19 +24,34 @@ Fixes featured in this plugin:
 * Fixed an issue where game would use more CPU than required when minimized
 
 ### Quality of life improvements
-* An option to change FPS cap has been added to SilentPatchBully.ini file (game defaults to 30FPS) with an in game button combo to toggle between 30 fps and 60 fps (SELECT + DPAD DOWN) or F11 on your keyboard.
-* Automatic settings configuration (game defaults to 1080p with High Shadows), see .ini file comments for more settings.
+* The FPS cap can be changed in SilentPatchBully.ini (30FPS by default) and cycled in game through a configurable
+  list of caps (30 and 60 by default) with SELECT + DPAD DOWN on a controller or F11 on the keyboard - both can be
+  rebound or disabled in the INI file
+* Automatic settings configuration (1080p with High Shadows by default) - settings are written to the game's registry
+  settings whenever they change in the INI file, so changes made afterwards in the game's own options menu are left alone
+* An experimental frame limiter mode (`FrameLimiterSleep=1`) that sleeps instead of spinning between frames,
+  freeing the CPU core the precise limiter otherwise keeps fully busy
+* An optional diagnostics log (`LogFile=1`) that records what was detected and applied, for bug reports
 * **FILE_FLAG_NO_BUFFERING** flag has been removed from IMG reading functions - potentially speeding up streaming
+
+All options are documented in the comments of `SilentPatchBully.ini`, which has to sit next to `SilentPatchBully.asi`.
 
 ## Compilation requirements
 
-Project is supposed to build out of the box with Visual Studio 2022.
+The project builds with Visual Studio 2022 using the **Desktop development with C++** workload, which provides
+the `v143` toolset and a Windows 10 SDK.
+
+* The `ModUtils` dependency is a git submodule - after cloning, run `git submodule update --init` to fetch it,
+  otherwise `Utils/MemoryMgr.h` will be missing.
+* Building copies `SilentPatchBully.ini` next to the produced `SilentPatchBully.asi`.
+* Every push is also built by GitHub Actions, and the resulting ASI and INI are available as workflow artifacts.
 
 ## Submitting feedback
 
 If you want to report it as a bug (any feedback is very much appreciated), first **ENSURE YOU HAVE AN UNMODDED GAME**
 (texture mods are fine, scripts - not so much). You can report a bug (.dmp file + a brief explanation on what
-you were doing when the game crashes) in the Issues page.
+you were doing when the game crashes) in the Issues page. Setting `LogFile=1` in the INI file and attaching the
+resulting `SilentPatchBully.log` helps a lot.
 
 ## Credits
 
