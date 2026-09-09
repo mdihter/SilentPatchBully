@@ -44,7 +44,8 @@ the `v143` toolset and a Windows 10 SDK.
   otherwise `Utils/MemoryMgr.h` will be missing.
 * Building copies `SilentPatchBully.ini` next to the produced `SilentPatchBully.asi`.
 * Every push is also built by GitHub Actions, and the resulting ASI and INI are available as workflow artifacts.
-* Every push to `master` additionally publishes a GitHub Release with `SilentPatchBully.zip` (the Master build).
+* Every push to `master` additionally publishes a GitHub Release with `SilentPatchBully.zip`: the Master build together with
+  the Ultimate ASI Loader (`dinput8.dll`), MiniDumper and a ReadMe, ready to extract into the game directory.
 
 ## Submitting feedback
 

@@ -56,8 +56,24 @@ jobs:
           echo "tag=build-${rev}.${build}-${GITHUB_SHA::7}" >> "$GITHUB_OUTPUT"
           echo "title=Build ${rev}.${build} (${GITHUB_SHA::7})" >> "$GITHUB_OUTPUT"
 
+      - name: Fetch bundled third-party components
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release download v9.7.4 --repo ThirteenAG/Ultimate-ASI-Loader --pattern Ultimate-ASI-Loader-NoPDB.zip --dir thirdparty
+          gh release download v1.0 --repo CookiePLMonster/MiniDumper --pattern MiniDumper.zip --dir thirdparty
+          cd thirdparty
+          sha256sum --check <<'SUMS'
+          14b3a1ad018899571ac9aa01482977f3c6d49e6cba99f552d01c5acacd1315e1  Ultimate-ASI-Loader-NoPDB.zip
+          156661320bfa9a080d3d7d099da8e1f5db9e0ca6a854f3ef500ab96579ed52a3  MiniDumper.zip
+          SUMS
+          unzip -j Ultimate-ASI-Loader-NoPDB.zip dinput8.dll -d ../dist
+          unzip -j MiniDumper.zip MiniDumper.asi -d ../dist
+
       - name: Package
-        run: cd dist && zip SilentPatchBully.zip SilentPatchBully.asi SilentPatchBully.ini
+        run: |
+          cp SilentPatchBully/ReadMe.txt dist/
+          cd dist && zip SilentPatchBully.zip SilentPatchBully.asi SilentPatchBully.ini ReadMe.txt dinput8.dll MiniDumper.asi
 
       - name: Create GitHub Release
         env:
