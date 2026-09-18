@@ -47,8 +47,18 @@
 
 static HINSTANCE hDLLModule;
 
-// Path to SilentPatchBully.ini next to the ASI, filled in by InjectHooks before anything reads it
+// Path to SilentPatchBully.ini next to the ASI, filled in on first use
 static wchar_t g_iniPath[MAX_PATH];
+
+static const wchar_t* GetINIPath()
+{
+	if (g_iniPath[0] == L'\0')
+	{
+		GetModuleFileNameW(hDLLModule, g_iniPath, _countof(g_iniPath) - 3); // Minus max required space for extension
+		PathRenameExtensionW(g_iniPath, L".ini");
+	}
+	return g_iniPath;
+}
 
 // Immediate operand of the frame limiter's FPS cap value
 static int32_t* const FPS_CAP_OPERAND = reinterpret_cast<int32_t*>(0x40618F + 1);
@@ -623,6 +633,44 @@ static LSTATUS RegSetKeyValueWLegacy(HKEY hKey, LPCWSTR lpSubKey, LPCWSTR lpValu
 	return status;
 }
 
+// ============= High DPI awareness =============
+// Bully has no dpiAware entry in its manifest, so on a display scaled above 100% Windows renders the game to a
+// virtual desktop and magnifies the result - a 3840x2160 screen at 150% looks like 2560x1440 to the game. Picking
+// any resolution larger than that virtual desktop magnifies the frame past the screen edges, so only its top left
+// corner stays visible and everything looks oversized. Declaring the process DPI aware before the game creates its
+// window makes it see, and render at, real pixels. Applied from DllMain rather than alongside the other fixes in
+// InjectHooks, because awareness only takes effect while the process has not created a window yet.
+namespace HighDPI
+{
+	static const char* appliedMode = "not applied";
+
+	static void Apply(const wchar_t* iniPath)
+	{
+		if (GetPrivateProfileIntW(L"SilentPatch", L"HighDPIAware", 1, iniPath) == 0)
+		{
+			appliedMode = "disabled in the INI";
+			return;
+		}
+
+		// Windows 10 version 1703 and newer - real pixels on every monitor, whatever each one is scaled to
+		using SetProcessDpiAwarenessContext_t = BOOL (WINAPI*)(HANDLE);
+		const auto pSetProcessDpiAwarenessContext = reinterpret_cast<SetProcessDpiAwarenessContext_t>(
+			GetProcAddress(GetModuleHandleW(L"user32.dll"), "SetProcessDpiAwarenessContext"));
+		if (pSetProcessDpiAwarenessContext != nullptr &&
+			pSetProcessDpiAwarenessContext(reinterpret_cast<HANDLE>(-4)) != FALSE) // DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2
+		{
+			appliedMode = "per-monitor aware (V2)";
+			return;
+		}
+
+		// Vista and newer - real pixels at the scaling the primary monitor had when the game started
+		if (SetProcessDPIAware() != FALSE)
+		{
+			appliedMode = "system aware";
+		}
+	}
+}
+
 // ============= Automatic game settings from the INI =============
 namespace GameSettings
 {
@@ -912,11 +960,11 @@ void InjectHooks()
 	using namespace Memory;
 
 	// Obtain a path to the INI next to the ASI
-	GetModuleFileNameW(hDLLModule, g_iniPath, _countof(g_iniPath) - 3); // Minus max required space for extension
-	PathRenameExtensionW(g_iniPath, L".ini");
+	GetINIPath();
 
 	Log::Init(g_iniPath, GetPrivateProfileIntW(L"SilentPatch", L"LogFile", 0, g_iniPath) != 0);
 	Log::Write("SilentPatch for Bully build %d.%d, INI: %ls", SILENTPATCH_REVISION_ID, SILENTPATCH_BUILD_ID, g_iniPath);
+	Log::Write("High DPI awareness: %s", HighDPI::appliedMode);
 
 	// If it's not 1.200, bail out
 	if (!MemEquals(0x860C6B, { 0xC7, 0x45, 0xFC, 0xFE, 0xFF, 0xFF, 0xFF }))
@@ -1588,6 +1636,7 @@ BOOL WINAPI DllMain(HINSTANCE hinstDLL, DWORD fdwReason, LPVOID lpvReserved)
 	if (fdwReason == DLL_PROCESS_ATTACH)
 	{
 		hDLLModule = hinstDLL;
+		HighDPI::Apply(GetINIPath());
 	}
 	return TRUE;
 }
