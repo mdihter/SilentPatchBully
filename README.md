@@ -26,6 +26,8 @@ Fixes featured in this plugin:
 ### Quality of life improvements
 * The game is declared DPI aware, so resolutions above 1080p are no longer magnified and cropped by Windows
   display scaling - can be turned off with `HighDPIAware=0`
+* An optional borderless fullscreen mode (`Borderless=1`) - the game covers the screen in a borderless window instead of
+  switching to exclusive fullscreen, so the display mode never changes and the game is not minimized when it loses focus
 * The game runs at 60FPS - scripts known to misbehave at that frame rate (classes and a few missions)
   automatically lower the cap to 30FPS while they run and restore 60FPS afterwards, the list is configurable in the INI file
 * Automatic settings configuration (1080p with High Shadows by default) - settings are written to the game's registry

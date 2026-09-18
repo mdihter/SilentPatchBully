@@ -10,6 +10,7 @@
 #include <Shlwapi.h>
 #include <Shlobj.h>
 #include <mmsystem.h>
+#include <d3d9.h>
 
 #include "Utils/MemoryMgr.h"
 #include "PoolsBully.h"
@@ -671,6 +672,104 @@ namespace HighDPI
 	}
 }
 
+// ============= Borderless fullscreen (Borderless=1 in the INI) =============
+// Bully always runs in exclusive fullscreen - it reads the WIN registry value, but then forces it off. Its fullscreen
+// window is already a borderless popup in the top left corner of the primary monitor, so this keeps that window and
+// only changes what makes the mode exclusive: the Direct3D device is created windowed, the display mode is never
+// switched, the window covers the whole monitor and it is not minimized when the game loses focus. The game still
+// renders at its own resolution, and Direct3D scales the frame to the window.
+namespace Borderless
+{
+	static RECT GetMonitorRect(HWND window)
+	{
+		MONITORINFO info;
+		info.cbSize = sizeof(info);
+		GetMonitorInfoW(MonitorFromWindow(window, MONITOR_DEFAULTTOPRIMARY), &info);
+		return info.rcMonitor;
+	}
+
+	static void MakeWindowed(D3DPRESENT_PARAMETERS* params)
+	{
+		params->Windowed = TRUE;
+		params->FullScreen_RefreshRateInHz = 0; // Must be 0 for a windowed device
+	}
+
+	static HRESULT (STDMETHODCALLTYPE *orgReset)(IDirect3DDevice9* device, D3DPRESENT_PARAMETERS* params);
+	static HRESULT STDMETHODCALLTYPE Reset_Windowed(IDirect3DDevice9* device, D3DPRESENT_PARAMETERS* params)
+	{
+		MakeWindowed(params);
+		return orgReset(device, params);
+	}
+
+	static HRESULT (STDMETHODCALLTYPE *orgCreateDevice)(IDirect3D9* d3d, UINT adapter, D3DDEVTYPE deviceType, HWND focusWindow,
+		DWORD behaviorFlags, D3DPRESENT_PARAMETERS* params, IDirect3DDevice9** device);
+	static HRESULT STDMETHODCALLTYPE CreateDevice_Windowed(IDirect3D9* d3d, UINT adapter, D3DDEVTYPE deviceType, HWND focusWindow,
+		DWORD behaviorFlags, D3DPRESENT_PARAMETERS* params, IDirect3DDevice9** device)
+	{
+		MakeWindowed(params);
+
+		const HWND window = params->hDeviceWindow != nullptr ? params->hDeviceWindow : focusWindow;
+		const RECT rect = GetMonitorRect(window);
+		SetWindowPos(window, nullptr, rect.left, rect.top, rect.right - rect.left, rect.bottom - rect.top, SWP_NOZORDER | SWP_NOACTIVATE);
+
+		const HRESULT result = orgCreateDevice(d3d, adapter, deviceType, focusWindow, behaviorFlags, params, device);
+
+		// Reset can only be reached through a device - every device shares one vtable, so hooking the first one covers them all
+		if (SUCCEEDED(result) && orgReset == nullptr)
+		{
+			void** vtable = *reinterpret_cast<void***>(*device);
+			orgReset = reinterpret_cast<decltype(orgReset)>(vtable[16]);
+			Memory::VP::Patch(&vtable[16], &Reset_Windowed);
+		}
+		Log::Write("Borderless: windowed Direct3D device for window %p at %ldx%ld, rendering %ux%u, result 0x%08lX", window,
+			rect.right - rect.left, rect.bottom - rect.top, params->BackBufferWidth, params->BackBufferHeight, static_cast<unsigned long>(result));
+		return result;
+	}
+
+	// Stands in for the game's calls that size its window to the game's resolution in the top left corner of the screen
+	static BOOL WINAPI MoveWindow_FillMonitor(HWND window, int /*x*/, int /*y*/, int /*width*/, int /*height*/, BOOL repaint)
+	{
+		const RECT rect = GetMonitorRect(window);
+		return MoveWindow(window, rect.left, rect.top, rect.right - rect.left, rect.bottom - rect.top, repaint);
+	}
+
+	static BOOL WINAPI SetWindowPos_FillMonitor(HWND window, HWND insertAfter, int /*x*/, int /*y*/, int /*width*/, int /*height*/, UINT flags)
+	{
+		const RECT rect = GetMonitorRect(window);
+		return SetWindowPos(window, insertAfter, rect.left, rect.top, rect.right - rect.left, rect.bottom - rect.top, flags);
+	}
+
+	// Replaces the game's function that switches the display to the game's resolution, reporting success
+	static int SwitchDisplayMode_Skip(const void* /*videoSettings*/)
+	{
+		return 1;
+	}
+
+	// The game loads Direct3D through LoadLibrary/GetProcAddress, so there is no import to hook. Every IDirect3D9 shares one
+	// vtable, so a throwaway instance is enough to hook CreateDevice there before the game creates its device.
+	static bool HookDirect3D()
+	{
+		const HMODULE d3d9 = LoadLibraryW(L"d3d9.dll"); // Never freed, the hooked vtable lives in it
+		if (d3d9 == nullptr)
+		{
+			return false;
+		}
+		using Direct3DCreate9_t = IDirect3D9* (WINAPI*)(UINT);
+		const auto pDirect3DCreate9 = reinterpret_cast<Direct3DCreate9_t>(GetProcAddress(d3d9, "Direct3DCreate9"));
+		IDirect3D9* d3d = pDirect3DCreate9 != nullptr ? pDirect3DCreate9(D3D_SDK_VERSION) : nullptr;
+		if (d3d == nullptr)
+		{
+			return false;
+		}
+
+		void** vtable = *reinterpret_cast<void***>(d3d);
+		orgCreateDevice = reinterpret_cast<decltype(orgCreateDevice)>(vtable[16]);
+		Memory::VP::Patch(&vtable[16], &CreateDevice_Windowed);
+		d3d->Release();
+		return true;
+	}
+}
+
 // ============= Automatic game settings from the INI =============
 namespace GameSettings
 {
@@ -1066,6 +1165,34 @@ void InjectHooks()
 
 	// Game settings from the INI, written to the registry only when they changed since they were last applied
 	GameSettings::Apply(g_iniPath);
+
+	// Borderless fullscreen instead of exclusive fullscreen
+	if (GetPrivateProfileIntW(L"SilentPatch", L"Borderless", 0, g_iniPath) != 0)
+	{
+		using namespace Borderless;
+
+		if (HookDirect3D())
+		{
+			InjectHook(0x405580, SwitchDisplayMode_Skip, PATCH_JUMP);
+
+			// Cover the whole monitor where the game sizes its window to its resolution - when it regains focus...
+			InjectHook(0x405E52, MoveWindow_FillMonitor, PATCH_CALL);
+			Nop(0x405E52 + 5, 1);
+
+			// ...and when the resolution is changed in the options menu
+			InjectHook(0x405FAF, SetWindowPos_FillMonitor, PATCH_CALL);
+			Nop(0x405FAF + 5, 1);
+
+			// Stay visible instead of minimizing when the game loses focus
+			Patch<int8_t>(0x405F46 + 1, SW_SHOWNA);
+
+			Log::Write("Borderless enabled");
+		}
+		else
+		{
+			Log::Write("Borderless requested but Direct3D 9 could not be hooked, staying in exclusive fullscreen");
+		}
+	}
 
 	if (const int INIoption = GetPrivateProfileIntW(L"SilentPatch", L"EnableControllers", -1, g_iniPath); INIoption == 0 || INIoption == 1)
 	{
